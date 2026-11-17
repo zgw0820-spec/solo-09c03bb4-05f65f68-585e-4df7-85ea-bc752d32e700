@@ -95,6 +95,63 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT NOT NULL,
     detail      TEXT
 );
+
+-- Append-only progress feed for the duty-station catch-up screen.
+--
+-- A node is written inside the SAME transaction as the disposal-state change
+-- it describes, so a node can never be visible without its state change and a
+-- state change can never commit without its node. Rows are never updated or
+-- deleted once committed: the ``status_snapshot`` captured at write time stays
+-- frozen forever, so nodes already read do not change when a later
+-- confirmation/acceptance moves the alarm on.
+--
+-- The per-alarm unique constraints are the hard dedupe guarantees:
+--   * exactly one submission node (same-number/same-content retries collapse),
+--   * exactly one terminal receipt node per notification role (unknown is not
+--     terminal and inserts nothing; the result is appended only once the
+--     gateway gives a definitive answer),
+--   * exactly one backup-generated node and one confirmation node
+--     (repeat confirmations collapse).
+CREATE TABLE IF NOT EXISTS progress_nodes (
+    seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id           TEXT NOT NULL UNIQUE,
+    alarm_no          TEXT NOT NULL,
+    cabinet_no        TEXT,
+    node_type         TEXT NOT NULL CHECK (
+                          node_type IN (
+                              'alarm_submitted',
+                              'primary_accepted',
+                              'primary_rejected',
+                              'backup_generated',
+                              'confirmed'
+                          )
+                      ),
+    occurred_at       TEXT NOT NULL,
+    occurred_real     REAL NOT NULL,
+    alarm_status      TEXT NOT NULL,
+    status_snapshot   TEXT NOT NULL,
+    notification_no   TEXT,
+    notification_role TEXT,
+    detail            TEXT,
+    UNIQUE(alarm_no, node_type),
+    UNIQUE(alarm_no, notification_role, node_type)
+);
+
+CREATE INDEX IF NOT EXISTS ix_progress_nodes_seq ON progress_nodes(seq);
+
+-- Catch-up (backfill) sessions. The high-water mark is fixed at session
+-- creation, so every page and every retry within one catch-up stays inside the
+-- same node range even while new nodes keep arriving. Sessions are persisted
+-- (not held in memory) so a restart never loses the catch-up position.
+CREATE TABLE IF NOT EXISTS catchup_sessions (
+    session_id      TEXT PRIMARY KEY,
+    start_cursor    INTEGER NOT NULL,
+    end_seq         INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_real    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_catchup_expires ON catchup_sessions(expires_real);
 """
 
 

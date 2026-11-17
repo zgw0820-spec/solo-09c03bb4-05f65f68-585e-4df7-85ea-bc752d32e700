@@ -95,6 +95,50 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 - 确认、查询、到期扫描都只做短事务，不等待网络。
 - 状态查询中的网关核对并发执行，最坏耗时约一次查询超时，而非逐条累加。
 
+### 7. 处置进展：只追加节点 + 游标分页补读
+
+告警屏断线期间，值班员需要补看过热告警的处置进展。系统在独立的只追加表
+`progress_nodes` 中记录五类节点，每个节点都带**告警号、柜号（若有）、发生时刻
+以及写入瞬间冻结的告警处置状态**：
+
+| 节点类型 | 何时写入 |
+|---|---|
+| `alarm_submitted` | 告警首次提交（与告警行、主通知行同一事务） |
+| `primary_accepted` | 网关**明确受理**主通知（与计时启动同一事务） |
+| `primary_rejected` | 网关**明确拒收**主通知 |
+| `backup_generated` | 逾期升级、备班通知生成（与 `escalated_at` 同一事务） |
+| `confirmed` | 人工确认（到期前后两个分支共用同一去重键，只有一条） |
+
+关键规则：
+
+- **回执未明不写受理/拒收节点**：`unknown` 只是待查状态，节点只在网关给出
+  确定性答复后追加；补查确定受理时节点采用网关受理时刻。
+- **同号同内容提交、重复确认不增加节点**：服务层先短路，数据库
+  `UNIQUE(alarm_no, node_type)` / `UNIQUE(alarm_no, notification_role, node_type)`
+  再兜底，并发下也不会出现第二条。
+- **处置状态与节点同一事务提交**：不可能看到节点却看不到状态变化，反之亦然。
+- **节点只插入、不更新、不删除**：已读节点的 `status_snapshot` 永久冻结，
+  后来的受理、确认不会改写历史节点，只会追加新节点。
+
+#### 补读与追读
+
+```
+断线重连
+  │  POST /progress/catchup {"cursor": 上次已读游标}
+  │    → 会话固定高水位 end_seq（此刻已提交节点的最大序号）
+  │  GET /progress?session_id=...&cursor=...&limit=...   反复翻页/重试
+  │    → 内容始终限定在固定窗口内，重试同游标结果完全一致
+  │  直到 caught_up=true，补读完成
+  └  GET /progress?cursor=<最后游标>（不带 session_id）持续追读新节点
+```
+
+- 补读会话持久化在 SQLite 中，**API 重启后仍可用同一 `session_id` 续读**。
+- 追读模式下每个已提交节点按 `seq` 严格升序、恰好出现一次；并发投递、确认、
+  重启都只追加节点，不会跳过或覆盖任何已提交变化。
+- 游标即节点 `seq`（整数、单调、无空洞）；`next_cursor` 原样回传即可翻下一页，
+  空页时回传当前游标并置 `caught_up=true`。
+- 可选 `alarm_no` 过滤只看单条告警的节点。
+
 ## 接口一览
 
 | 方法 | 路径 | 用途 |
@@ -105,6 +149,8 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | GET | `/alarms/{alarm_no}/notifications` | 该告警的通知明细 |
 | GET | `/notifications/{notification_no}` | 按通知号查询网关受理结果 |
 | GET | `/alarms` | 列出告警，可按 `status` 过滤 |
+| POST | `/progress/catchup` | 开始一次断线补读，固定本次补读的节点范围 |
+| GET | `/progress` | 按游标分页读取处置进展（补读/追读同一接口） |
 | GET | `/health` | 健康检查 |
 
 状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
@@ -179,14 +225,16 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 42 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、Swagger/OpenAPI，以及处置进展的五类节点去重、
+回执未明不落节点、节点状态冻结、补读窗口稳定与重试一致、游标分页、
+重启后续读和并发不丢节点。
 
 ## 已知限制
 

@@ -27,6 +27,7 @@ import secrets
 from typing import Any
 
 from .db import Database, iso_from_real, parse_ts, utc_now
+from .progress import ProgressService
 from .view import build_alarm_view
 
 
@@ -51,6 +52,7 @@ def _new_notification_no(alarm_no: str, role: str) -> str:
 class AlarmService:
     def __init__(self, db: Database):
         self.db = db
+        self.progress = ProgressService(db)
 
     # ------------------------------------------------------------------ helpers
 
@@ -193,6 +195,17 @@ class AlarmService:
                 "submitted",
                 f"primary notification {primary['notification_no']}",
             )
+            # Progress node #1: alarm submission. Same-transaction with the
+            # alarm row and the primary notification row.
+            self._add_progress_node(
+                conn,
+                payload.alarm_no,
+                "alarm_submitted",
+                now_real,
+                detail=f"primary notification {primary['notification_no']} enqueued",
+                notification_no=primary["notification_no"],
+                notification_role="primary",
+            )
             return self._snapshot(conn, payload.alarm_no, now_real), False
 
     # ----------------------------------------------------------------- confirm
@@ -220,6 +233,14 @@ class AlarmService:
 
             if updated:
                 self._event(conn, alarm_no, "confirmed", f"by {confirmed_by}" + (f": {note}" if note else ""))
+                # Progress node: manual confirmation before the deadline.
+                self._add_progress_node(
+                    conn,
+                    alarm_no,
+                    "confirmed",
+                    now_real,
+                    detail=f"confirmed by {confirmed_by}" + (f": {note}" if note else ""),
+                )
                 return self._snapshot(conn, alarm_no, now_real)
 
             # Escalation already committed. Record the late confirmation but
@@ -267,6 +288,24 @@ class AlarmService:
                     else "; backup already dispatched, cannot be recalled"
                     if backup_row is not None
                     else ""
+                ),
+            )
+            # One confirmation node regardless of timing: the dedupe key is the
+            # same as the pre-deadline path, so an alarm can never get two.
+            self._add_progress_node(
+                conn,
+                alarm_no,
+                "confirmed",
+                now_real,
+                detail=(
+                    f"confirmed by {confirmed_by} after the escalation deadline"
+                    + (
+                        "; queued backup cancelled before dispatch"
+                        if cancelled
+                        else "; backup already dispatched, cannot be recalled"
+                        if backup_row is not None
+                        else ""
+                    )
                 ),
             )
             return self._snapshot(conn, alarm_no, now_real)
@@ -338,6 +377,20 @@ class AlarmService:
                 alarm_no,
                 "escalated",
                 f"backup notification {backup['notification_no']} queued after deadline",
+            )
+            # Progress node: backup generation, in the same transaction as the
+            # escalated_at update and the backup row insert.
+            self._add_progress_node(
+                conn,
+                alarm_no,
+                "backup_generated",
+                now_real,
+                detail=(
+                    f"backup notification {backup['notification_no']} queued "
+                    "after the confirmation deadline"
+                ),
+                notification_no=backup["notification_no"],
+                notification_role="backup",
             )
             return True
 
@@ -494,6 +547,22 @@ class AlarmService:
                         "primary_accepted",
                         f"{row['notification_no']} accepted; {deadline_seconds}s confirmation clock started",
                     )
+                    # Progress node: definitive gateway acceptance of the
+                    # primary. The unique (alarm, role, type) index makes a
+                    # re-discovered acceptance (lookup after a lost receipt,
+                    # restart recovery) collapse instead of adding a second node.
+                    self._add_progress_node(
+                        conn,
+                        row["alarm_no"],
+                        "primary_accepted",
+                        accepted_real_value,
+                        detail=(
+                            f"{row['notification_no']} accepted by gateway; "
+                            f"{deadline_seconds}s confirmation clock started"
+                        ),
+                        notification_no=row["notification_no"],
+                        notification_role="primary",
+                    )
                 else:
                     self._event(
                         conn,
@@ -508,6 +577,19 @@ class AlarmService:
                     f"{row['role']}_rejected",
                     f"{row['notification_no']}: {detail}",
                 )
+                if row["role"] == "primary":
+                    # Progress node: definitive gateway rejection. An unknown
+                    # receipt never reaches here, so an unproven outcome can
+                    # never be mis-recorded as a rejection.
+                    self._add_progress_node(
+                        conn,
+                        row["alarm_no"],
+                        "primary_rejected",
+                        parse_ts(now),
+                        detail=f"{row['notification_no']} rejected by gateway: {detail}",
+                        notification_no=row["notification_no"],
+                        notification_role="primary",
+                    )
             elif state == "unknown":
                 self._event(
                     conn,
@@ -546,4 +628,35 @@ class AlarmService:
             [dict(n) for n in notifications],
             [dict(e) for e in events],
             now_real=now_real,
+        )
+
+    def _add_progress_node(
+        self,
+        conn,
+        alarm_no: str,
+        node_type: str,
+        now_real: float,
+        *,
+        detail: str | None = None,
+        notification_no: str | None = None,
+        notification_role: str | None = None,
+    ) -> None:
+        """Append a progress node atomically with the caller's state change.
+
+        The status snapshot is rebuilt from the rows visible *inside this
+        transaction*, so the frozen node status is exactly the status the
+        committed change produced. A duplicate attempt (same deterministic node
+        id) is a no-op, which keeps retries and repeat confirmations silent.
+        """
+        snapshot = self._snapshot(conn, alarm_no, now_real)
+        self.progress.add_node(
+            conn,
+            alarm_no=alarm_no,
+            node_type=node_type,
+            status=snapshot["status"],
+            status_snapshot=snapshot,
+            detail=detail,
+            notification_no=notification_no,
+            notification_role=notification_role,
+            occurred_real=now_real,
         )

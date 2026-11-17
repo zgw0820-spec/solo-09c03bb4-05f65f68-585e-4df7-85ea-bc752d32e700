@@ -17,11 +17,15 @@ from .gateway_client import GatewayClient
 from .models import (
     AlarmCreate,
     AlarmView,
+    CatchupSession,
+    CatchupStartRequest,
     ConfirmRequest,
     HealthView,
     NotificationList,
     NotificationView,
+    ProgressPage,
 )
+from .progress import CatchupNotFoundError
 from .service import AlarmService, ConflictError, NotFoundError
 from .worker import Dispatcher
 
@@ -86,7 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 主通知只有拿到网关的受理确认才开始计时；回执不明标记为 "
             "`receipt_unconfirmed`，查明前绝不触发升级。\n"
             "- 通知号是网关幂等键；API 重启后按数据库中的待办继续投递/查询。\n"
-            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。"
+            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。\n"
+            "- `/progress` 提供只追加、按游标分页的处置进展：节点与处置状态同事务提交，"
+            "节点状态一经写入即冻结；`/progress/catchup` 固定补读范围，供断线告警屏稳定补读后追读。"
         ),
         lifespan=lifespan,
     )
@@ -251,6 +257,67 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status_filter:
             views = [v for v in views if v["status"] == status_filter]
         return {"items": views, "total": len(views)}
+
+    # -------------------------------------------------- disposal progress feed
+
+    @app.post(
+        "/progress/catchup",
+        response_model=CatchupSession,
+        tags=["处置进展"],
+        status_code=status.HTTP_201_CREATED,
+        summary="断线补读：固定本次补读的节点范围",
+        description=(
+            "告警屏重新上线时调用。以当前已提交节点的最大序号作为**固定高水位**"
+            "（`end_seq`），补读期间无论投递、确认还是重启产生多少新节点，分页与"
+            "重试都只返回该范围内的稳定内容。`cursor` 为断线前已读到的游标，"
+            "首次补读或需要全量补读时传 0。补读完成（页面 `caught_up=true`）后，"
+            "改用 `GET /progress` 从末尾游标继续追读新节点。会话持久化在数据库中，"
+            "API 重启后仍可凭 `session_id` 继续补读。"
+        ),
+    )
+    async def start_catchup(payload: CatchupStartRequest, request: Request) -> dict:
+        service: AlarmService = request.app.state.service
+        return service.progress.create_catchup(payload.cursor)
+
+    @app.get(
+        "/progress",
+        response_model=ProgressPage,
+        tags=["处置进展"],
+        summary="按游标分页读取处置进展（补读/追读同一接口）",
+        description=(
+            "返回严格按序号升序的进展节点页。携带 `session_id` 时读取范围被会话"
+            "高水位固定，适合断线补读：同一游标重试得到完全相同的内容。不携带"
+            "`session_id` 时为追读模式，从 `cursor` 读到当前最新已提交节点，适合"
+            "补读完成后持续轮询。每个节点记录告警号、柜号（若有）、节点类型、"
+            "发生时刻以及写入瞬间冻结的处置状态；已读节点不会因后来的受理或确认"
+            "而改变。"
+        ),
+        responses={404: {"description": "catch-up session not found or expired"}},
+    )
+    async def read_progress(
+        request: Request,
+        cursor: int = Query(default=0, ge=0, description="上一页返回的 next_cursor；首次读取传 0"),
+        limit: int = Query(default=50, ge=1, le=200, description="每页节点数上限"),
+        session_id: str | None = Query(
+            default=None, description="POST /progress/catchup 返回的补读会话 id"
+        ),
+        alarm_no: str | None = Query(
+            default=None, description="可选：只读取某一告警号的节点"
+        ),
+    ) -> dict:
+        service: AlarmService = request.app.state.service
+        try:
+            return service.progress.read_page(
+                limit=limit, cursor=cursor, session_id=session_id, alarm_no=alarm_no
+            )
+        except CatchupNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"catch-up session {str(exc)!r} not found or expired; "
+                    "start a new session via POST /progress/catchup"
+                ),
+            ) from exc
 
     return app
 

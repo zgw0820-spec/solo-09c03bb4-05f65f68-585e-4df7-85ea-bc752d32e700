@@ -140,6 +140,79 @@ def main() -> int:
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
 
+    print("[6] progress feed: nodes, cursor paging and stable catch-up window")
+    # A fresh alarm gives a known, small node set to assert against.
+    call("POST", f"{API}/alarms", payload(f"{RUN}-PROG", 2))
+    wait_for(f"{RUN}-PROG", lambda v: v["status"] == "escalated")
+
+    # Cursor paging with a tiny page size: no gaps, no duplicates, ordered.
+    page_nodes = []
+    cursor = 0
+    for _ in range(50):
+        status, page = call("GET", f"{API}/progress?cursor={cursor}&limit=2&alarm_no={RUN}-PROG")
+        check(status == 200, "progress page responds")
+        page_nodes.extend(page["items"])
+        assert len(page["items"]) <= 2
+        cursor = page["next_cursor"]
+        if page["caught_up"]:
+            break
+    kinds = [n["node_type"] for n in page_nodes]
+    check(
+        kinds == ["alarm_submitted", "primary_accepted", "backup_generated"],
+        f"progress nodes in order: {kinds}",
+    )
+    check(all(n["cabinet_no"] == "A07" for n in page_nodes), "cabinet number recorded on every node")
+    seqs = [n["seq"] for n in page_nodes]
+    check(seqs == sorted(seqs) and len(seqs) == len(set(seqs)), "cursor seqs ordered and unique")
+    check(
+        page_nodes[0]["status_snapshot"]["status"] == page_nodes[0]["alarm_status"],
+        "node carries the disposal status frozen at write time",
+    )
+
+    # Catch-up session pins a stable range while more nodes are committed.
+    status, session = call("POST", f"{API}/progress/catchup", {"cursor": 0})
+    check(status == 201 and session["end_seq"] >= seqs[-1], "catch-up session created with pinned end_seq")
+    pinned = session["end_seq"]
+    # Activity that only starts AFTER the session must stay outside its window.
+    call("POST", f"{API}/alarms", payload(f"{RUN}-AFTER", 3))
+    wait_for(f"{RUN}-AFTER", lambda v: v["primary_accepted_at"] is not None)
+    call("POST", f"{API}/alarms/{RUN}-PROG/confirm", {"confirmed_by": "张工"})
+    time.sleep(0.5)
+    caught = []
+    cursor = 0
+    for _ in range(50):
+        status, page = call(
+            "GET",
+            f"{API}/progress?cursor={cursor}&limit=1&session_id={session['session_id']}",
+        )
+        check(status == 200, "catch-up page responds")
+        check(page["window_end_seq"] == pinned, "catch-up window stays pinned")
+        caught.extend(page["items"])
+        cursor = page["next_cursor"]
+        if page["caught_up"]:
+            break
+    check(max(n["seq"] for n in caught) <= pinned, "catch-up never crosses the pinned high-water mark")
+    check(
+        all(n["alarm_no"] != f"{RUN}-AFTER" for n in caught),
+        "nodes created after the session stay outside the catch-up window",
+    )
+
+    # Retry the same cursor: identical content.
+    _, retry_page = call(
+        "GET", f"{API}/progress?cursor=0&limit=100&session_id={session['session_id']}"
+    )
+    check([n["node_id"] for n in retry_page["items"]] == [n["node_id"] for n in caught],
+          "catch-up retry returns the same nodes")
+
+    # Live tailing from the pinned cursor delivers every post-catch-up node.
+    _, tail = call("GET", f"{API}/progress?cursor={pinned}")
+    tailed_alarms = {n["alarm_no"] for n in tail["items"]}
+    check(f"{RUN}-AFTER" in tailed_alarms, "live tailing delivers nodes from the new alarm")
+    check(
+        any(n["node_type"] == "confirmed" and n["alarm_no"] == f"{RUN}-PROG" for n in tail["items"]),
+        "live tailing from the end cursor delivers newly committed nodes",
+    )
+
     print("smoke test passed")
     return 0
 

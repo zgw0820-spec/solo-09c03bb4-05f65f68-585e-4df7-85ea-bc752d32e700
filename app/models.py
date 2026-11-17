@@ -137,6 +137,68 @@ class NotificationList(BaseModel):
     total: int
 
 
+class ProgressNodeView(BaseModel):
+    seq: int = Field(description="Monotonic, gap-free cursor; pass the last value as the next cursor")
+    node_id: str = Field(description="Deterministic idempotency key of this node")
+    alarm_no: str = Field(description="Alarm number this node belongs to")
+    cabinet_no: str | None = Field(default=None, description="Cabinet number when the alarm payload provides one")
+    node_type: str = Field(
+        description=(
+            "alarm_submitted | primary_accepted | primary_rejected | "
+            "backup_generated | confirmed"
+        )
+    )
+    node_type_text: str = Field(description="Human-readable Chinese node label")
+    occurred_at: str = Field(description="UTC time at which the recorded event happened")
+    alarm_status: str = Field(
+        description="Alarm disposal status frozen at the moment the node was written"
+    )
+    alarm_status_text: str = Field(description="Human-readable Chinese status label at that moment")
+    status_snapshot: dict[str, Any] = Field(
+        description="Full alarm view as it was when the node was committed; never changes afterwards"
+    )
+    notification_no: str | None = None
+    notification_role: Literal["primary", "backup"] | None = None
+    detail: str | None = None
+
+
+class ProgressPage(BaseModel):
+    items: list[ProgressNodeView]
+    next_cursor: int = Field(
+        description="Cursor for the following page; identical to the request cursor when the page is empty"
+    )
+    has_more: bool = Field(description="True when at least one more node is available in the current window")
+    caught_up: bool = Field(
+        description="True when this page reached the pinned catch-up window end (or the live feed end)"
+    )
+    window_end_seq: int = Field(
+        description="Inclusive high-water mark of this read; fixed for a catch-up session"
+    )
+    session_id: str | None = Field(
+        default=None, description="Echoes the catch-up session when one is being used"
+    )
+
+
+class CatchupStartRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"cursor": 0}},
+    )
+    cursor: int = Field(
+        default=0,
+        ge=0,
+        description="Last cursor already consumed before the screen went offline; 0 means full history",
+    )
+
+
+class CatchupSession(BaseModel):
+    session_id: str
+    start_cursor: int
+    end_seq: int = Field(description="Pinned inclusive high-water mark; pages never pass this seq during catch-up")
+    created_at: str
+    expires_in_seconds: int
+
+
 class HealthView(BaseModel):
     status: str
     database: str
